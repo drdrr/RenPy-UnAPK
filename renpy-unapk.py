@@ -47,7 +47,7 @@ shutil.move(os.path.join(os.getcwd(), 'assets', 'android-presplash.jpg'), gamefo
 
 tempfiles = os.listdir()
 for i in tempfiles:
-    if i == 'extract' or '.py' in i or '.apk' in i or '.exe' in i:
+    if i == 'extract' or i.endswith('.py') or i.endswith('.apk') or i.endswith('.exe'):
         pass
     else:
         try:
@@ -59,4 +59,4 @@ remove_x(gamefolder, 'x-')
 writeunrpyc(os.path.join(gamefolder, 'game'))
 
 print("\n生成完毕\n\n【重要事项】\n已在extract/game文件夹中生成un.rpyc文件，用于将.rpyc格式还原为.rpy。\n请用RenPy启动一次工程，然后即可把un.rpyc文件删除")
-input('\n按任意键退出')
+input('\n按回车键退出')
