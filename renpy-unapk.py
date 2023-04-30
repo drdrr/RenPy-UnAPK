@@ -196,8 +196,8 @@ def main():
     "Main."
     args = parse_arg()
 
-    print("RenPy-UnApk：将APK格式的RenPy游戏恢复为工程文件")
-    print("By Koshiro, Version 1.3")
+    print("RenPy-UnApk：将APK格式的RenPy游戏恢复为工程文件（提取+反编译）")
+    print("By Koshiro, Version 1.35")
     print("\n使用前请将apk文件放在本目录下\n")
 
     allfiles = os.listdir()
