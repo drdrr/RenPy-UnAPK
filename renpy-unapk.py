@@ -1,222 +1,322 @@
-"""还原并反编译APK格式的RenPy游戏"""
+import sys
 import zipfile
-import os
 import shutil
 import argparse
-import glob
-import itertools
-from os import path, walk
-from operator import itemgetter
+import logging
+import traceback
 
+try:
+    from multiprocessing import Pool, cpu_count
+except ImportError:
+    # Mock required support when multiprocessing is unavailable
+    def cpu_count():
+        return 1
+
+from pathlib import Path
 import unrpyc
-from decompiler import magic
+
+class Context:
+    def __init__(self):
+        self.log_contents = []
+        self.error = None
+        self.state = "error"
+        self.value = None
+
+    def log(self, message):
+        self.log_contents.append(message)
+
+    def set_error(self, error):
+        self.error = error
+
+    def set_result(self, value):
+        self.value = value
+
+    def set_state(self, state):
+        self.state = state
 
 
-def remove_x(dir_path: str, some_text: str) -> None:
-    """Recursively remove specified text from all file and directory names in the given directory."""
-    
+def worker_common(arg_tup):
+    """
+    Standalone worker function for decompiling RPYC files.
+
+    Args:
+        arg_tup (tuple): Tuple containing (args, filename)
+
+    Returns:
+        Context: Decompilation result context
+    """
+    args, filename = arg_tup
+    context = Context()
+
     try:
-        names = os.listdir(dir_path)
-    except OSError as e:
-        print(f"Error: {e}")
-        return
+        # Use the original unrpyc decompilation method with default arguments
+        unrpyc.decompile_rpyc(
+            filename, context,
+            overwrite=getattr(args, 'clobber', False),
+            try_harder=getattr(args, 'try_harder', False)
+            dump=getattr(args, 'dump', False),
+            no_pyexpr=getattr(args, 'no_pyexpr', False),
+            comparable=getattr(args, 'comparable', False),
+            init_offset=getattr(args, 'init_offset', True),
+            sl_custom_names=getattr(args, 'sl_custom_names', None),
+            translator=getattr(args, 'translator', None)
+        )
 
-    for name in names:
-        sub_path = os.path.join(dir_path, name)
+    except Exception as e:
+        context.set_error(e)
+        context.log(f'Error while decompiling {filename}:')
+        context.log(traceback.format_exc())
 
-        if os.path.isdir(sub_path):
-            remove_x(sub_path, some_text)
+    return context
 
-        name_parts = os.path.splitext(name)
-        name = name_parts[0].replace(some_text, '') + name_parts[1]
-        new_path = os.path.join(dir_path, name)
 
-        try:
-            os.rename(sub_path, new_path)
-        except OSError as e:
-            print(f"Error renaming {sub_path} to {new_path}: {e}")
+def run_workers(worker, common_args, private_args, parallelism):
+    """
+    Runs worker in parallel using multiprocessing.
 
-def extract(apkfile: str) -> None:
-    """Extracts required files from an APK archive and moves them to a specific folder."""
-    print(f"正在还原{apkfile}……")
+    Args:
+        worker (callable): Worker function to execute
+        common_args (argparse.Namespace): Common arguments
+        private_args (list): List of files to process
+        parallelism (int): Number of processes to use
 
-    # Get the base name of the APK file
-    apk_base = os.path.basename(apkfile)
+    Returns:
+        list: Results from workers
+    """
+    worker_args = ((common_args, x) for x in private_args)
 
-    # Create required directories
-    game_folder = os.path.join(os.getcwd(), apk_base[:-4])
-    temp_folder = os.path.join(os.getcwd(), "TMP_FOR_UNAPK")
-    try:
-        os.makedirs(game_folder, exist_ok=True)
-        os.makedirs(temp_folder, exist_ok=True)
-    except OSError as e:
-        print(f"Error creating directory: {e}")
-        return
-
-    # Extract files to the temporary folder
-    with zipfile.ZipFile(apkfile) as zf:
-        zf.extractall(temp_folder)
-
-    # Move required files to the game folder
-    shutil.move(os.path.join(temp_folder, 'assets', 'x-game'), game_folder)
-    shutil.move(os.path.join(temp_folder, 'res', 'mipmap-xxxhdpi-v4', 'icon_background.png'), os.path.join(game_folder, 'android-icon_background.png'))
-    shutil.move(os.path.join(temp_folder, 'res', 'mipmap-xxxhdpi-v4', 'icon_foreground.png'), os.path.join(game_folder, 'android-icon_foreground.png'))
-    shutil.move(os.path.join(temp_folder, 'assets', 'android-presplash.jpg'), game_folder)
-
-    # Remove temporary files and directories
-    tempfiles = os.listdir(temp_folder)
-    for j in tempfiles:
-        j_path = os.path.join(temp_folder, j)
-        try:
-            os.remove(j_path)
-        except:
-            shutil.rmtree(j_path)
-    shutil.rmtree(temp_folder)
-
-    # Remove 'x-' from directory and file names in the game folder
-    remove_x(game_folder, 'x-')
-    
-    print(f"{apk_base} 已成功提取至 {game_folder}")
-
-def unrpyc_main(apkfile : str, args) -> None:
-    "Code from unrpyc.main"
-    print(f"正在反编译{apkfile}...")
-
-    if args.write_translation_file and not args.clobber and path.exists(args.write_translation_file):
-        pass
-
-    if args.translation_file:
-        with open(args.translation_file, 'rb') as in_file:
-            args.translations = in_file.read()
-
-    # Expand wildcards
-    def glob_or_complain(s):
-        retval = glob.glob(s)
-        if not retval:
-            print("File not found: " + s)
-        return retval
-    filesAndDirs = list(map(glob_or_complain, [apkfile[:-4]]))
-    # Concatenate lists
-    filesAndDirs = list(itertools.chain(*filesAndDirs))
-
-    # Recursively add .rpyc files from any directories passed
-    files = []
-    for k in filesAndDirs:
-        if path.isdir(k):
-            for dirpath, _, filenames in walk(k):
-                files.extend(path.join(dirpath, j) for j in filenames if len(j) >= 5 and j.endswith(('.rpyc', '.rpymc')))
-        else:
-            files.append(k)
-    
-    # Check if we actually have files. Don't worry about
-    # no parameters passed, since ArgumentParser catches that
-    if len(files) == 0:
-        print("No script files to decompile.")
-        return
-
-    files = [(args, x, path.getsize(x)) for x in files]
-
-    # Decompile in the order Ren'Py loads in
-    files.sort(key=itemgetter(1))
-    results = list(map(unrpyc.worker, files))
-
-    if args.write_translation_file:
-        print("Writing translations to %s..." % args.write_translation_file)
-        translated_dialogue = {}
-        translated_strings = {}
-        good = 0
-        bad = 0
-        for result in results:
-            if not result:
-                bad += 1
-                continue
-            good += 1
-            translated_dialogue.update(magic.loads(result[0], unrpyc.cls_factory_75))
-            translated_strings.update(result[1])
-        with open(args.write_translation_file, 'wb') as out_file:
-            magic.safe_dump((args.language, translated_dialogue, translated_strings), out_file)
-
+    results = []
+    if parallelism > 1:
+        with Pool(parallelism) as pool:
+            for result in pool.imap(worker, worker_args, 1):
+                results.append(result)
+                for line in result.log_contents:
+                    print(line)
+                print("")
     else:
-        # Check per file if everything went well and report back
-        good = results.count(True)
-        bad = results.count(False)
+        for result in map(worker, worker_args):
+            results.append(result)
+            for line in result.log_contents:
+                print(line)
+            print("")
 
-    print("RPYC反编译完成！")
+    return results
 
-def parse_arg():
-    "Parse args."
-    parser = argparse.ArgumentParser(description="Decompile .rpyc/.rpymc files")
 
-    parser.add_argument('-c', '--clobber', dest='clobber', action='store_false',
-                        help="overwrites existing output files")
+class RenPyUnapk:
+    def __init__(self, args=None):
+        """Initialize the RenPy Unapk tool with configuration."""
+        self.logger = self._setup_logging()
+        self.args = self._prepare_args(args)
 
-    parser.add_argument('-d', '--dump', dest='dump', action='store_true',
-                        help="instead of decompiling, pretty print the ast to a file")
+    def _setup_logging(self):
+        """Configure logging for the application."""
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s: %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
+        return logging.getLogger(__name__)
 
-    parser.add_argument('-t', '--translation-file', dest='translation_file', action='store', default=None,
-                        help="use the specified file to translate during decompilation")
+    def _prepare_args(self, args):
+        """
+        Prepare arguments for decompilation, ensuring all necessary attributes exist.
 
-    parser.add_argument('-T', '--write-translation-file', dest='write_translation_file', action='store', default=None,
-                        help="store translations in the specified file instead of decompiling")
+        Args:
+            args (argparse.Namespace or None): Input arguments
 
-    parser.add_argument('-l', '--language', dest='language', action='store', default='english',
-                        help="if writing a translation file, the language of the translations to write")
+        Returns:
+            argparse.Namespace: Prepared arguments with default values
+        """
+        # Start with a base Namespace with default values
+        prepared_args = argparse.Namespace(
+            clobber=False,
+            try_harder=False,
+            dump=False,
+            no_pyexpr=False,
+            comparable=False,
+            init_offset=True,
+            sl_custom_names=None,
+            translator=None
+        )
 
-    parser.add_argument('--sl1-as-python', dest='decompile_python', action='store_true',
-                        help="Only dumping and for decompiling screen language 1 screens. "
-                        "Convert SL1 Python AST to Python code instead of dumping it or converting it to screenlang.")
+        # Update with provided args if any
+        if args:
+            for attr, value in vars(args).items():
+                setattr(prepared_args, attr, value)
 
-    parser.add_argument('--comparable', dest='comparable', action='store_true',
-                        help="Only for dumping, remove several false differences when comparing dumps. "
-                        "This suppresses attributes that are different even when the code is identical, such as file modification times. ")
+        return prepared_args
 
-    parser.add_argument('--no-pyexpr', dest='no_pyexpr', action='store_true',
-                        help="Only for dumping, disable special handling of PyExpr objects, instead printing them as strings. "
-                        "This is useful when comparing dumps from different versions of Ren'Py. "
-                        "It should only be used if necessary, since it will cause loss of information such as line numbers.")
+    def remove_prefix_from_names(self, dir_path: Path, prefix: str) -> None:
+        """
+        Recursively remove specified prefix from all file and directory names.
 
-    parser.add_argument('--tag-outside-block', dest='tag_outside_block', action='store_true',
-                        help="Always put SL2 'tag's on the same line as 'screen' rather than inside the block. "
-                        "This will break compiling with Ren'Py 7.3 and above, but is needed to get correct line numbers "
-                        "from some files compiled with older Ren'Py versions.")
+        Args:
+            dir_path (Path): Directory to process
+            prefix (str): Prefix to remove from names
+        """
+        for item in dir_path.rglob('*'):
+            new_name = item.name.replace(prefix, '')
+            new_path = item.parent / new_name
 
-    parser.add_argument('--init-offset', dest='init_offset', action='store_true',
-                        help="Attempt to guess when init offset statements were used and insert them. "
-                        "This is always safe to enable if the game's Ren'Py version supports init offset statements, "
-                        "and the generated code is exactly equivalent, only less cluttered.")
+            try:
+                item.rename(new_path)
+            except OSError as e:
+                self.logger.error(f"Could not rename {item}: {e}")
 
-    parser.add_argument('--try-harder', dest="try_harder", action="store_true",
-                        help="Tries some workarounds against common obfuscation methods. This is a lot slower.")
+    def extract_apk(self, apk_path: Path) -> Path:
+        """
+        Extract game files from an APK.
 
-    args = parser.parse_args()
-    return args
+        Args:
+            apk_path (Path): Path to the APK file
+
+        Returns:
+            Path: Extracted game directory
+        """
+        self.logger.info(f"Extracting {apk_path}")
+
+        # Create extraction directories
+        game_folder = apk_path.with_suffix('')
+        temp_folder = Path.cwd() / "TMP_APK_EXTRACT"
+        game_folder.mkdir(exist_ok=True)
+        temp_folder.mkdir(exist_ok=True)
+
+        # Extract APK contents
+        with zipfile.ZipFile(apk_path) as zf:
+            zf.extractall(temp_folder)
+
+        # Move required files
+        try:
+            shutil.move(
+                temp_folder / 'assets' / 'x-game',
+                game_folder
+            )
+
+            # Move icons and splash screen
+            icon_sources = [
+                ('res/mipmap-xxxhdpi-v4/icon_background.png', 'android-icon_background.png'),
+                ('res/mipmap-xxxhdpi-v4/icon_foreground.png', 'android-icon_foreground.png'),
+                ('assets/android-presplash.jpg', 'android-presplash.jpg')
+            ]
+
+            for src, dest in icon_sources:
+                src_path = temp_folder / src
+                if src_path.exists():
+                    shutil.move(src_path, game_folder / dest)
+
+        except Exception as e:
+            self.logger.error(f"Error moving files: {e}")
+            raise
+
+        # Clean up temporary folder
+        shutil.rmtree(temp_folder)
+
+        # Remove 'x-' prefix from files and directories
+        self.remove_prefix_from_names(game_folder, 'x-')
+
+        self.logger.info(f"Extracted to {game_folder}")
+        return game_folder
+
+    def decompile_rpyc(self, game_folder: Path):
+        """
+        Decompile RenPy scripts in the game folder.
+
+        Args:
+            game_folder (Path): Folder containing game files
+        """
+        self.logger.info(f"Decompiling RenPy scripts in {game_folder}")
+
+        # Find all .rpyc and .rpymc files
+        rpyc_files = list(game_folder.rglob('*.rpyc')) + list(game_folder.rglob('*.rpymc'))
+
+        if not rpyc_files:
+            self.logger.warning("No script files found to decompile.")
+            return
+
+        # Use multiprocessing to match the original implementation
+        parallelism = min(max(1, cpu_count() - 1), len(rpyc_files))
+
+        # Run workers similar to the original implementation
+        results = run_workers(worker_common, self.args, rpyc_files, parallelism)
+
+        # Log results
+        success = sum(result.state == "ok" for result in results)
+        skipped = sum(result.state == "skip" for result in results)
+        failed = sum(result.state == "error" for result in results)
+        broken = sum(result.state == "bad_header" for result in results)
+
+        self.logger.info(f"Decompilation summary:")
+        self.logger.info(f"Total files: {len(results)}")
+        self.logger.info(f"Successfully decompiled: {success}")
+        self.logger.info(f"Skipped: {skipped}")
+        self.logger.info(f"Failed: {failed}")
+        self.logger.info(f"Bad headers: {broken}")
+
+    def process_apk(self, apk_path: Path):
+        """
+        Main processing method for an APK file.
+
+        Args:
+            apk_path (Path): Path to the APK file
+        """
+        try:
+            game_folder = self.extract_apk(apk_path)
+            self.decompile_rpyc(game_folder)
+            self.logger.info(f"Successfully processed {apk_path}")
+        except Exception as e:
+            self.logger.error(f"Failed to process {apk_path}: {e}")
+
+
+def parse_arguments():
+    """Parse command-line arguments for the tool."""
+    parser = argparse.ArgumentParser(description="RenPy APK Extraction and Decompilation Tool")
+
+    parser.add_argument('apk', nargs='?', help='Path to APK file to process')
+
+    parser.add_argument('-l', '--language', default='english',
+                        help='Language for translation file (default: english)')
+
+    parser.add_argument('-t', '--translation-file'
+                        help='File to use for translations during decompilation')
+
+    parser.add_argument('--try-harder', action='store_true',
+                        help='Attempt advanced deobfuscation techniques')
+
+    parser.add_argument('-c', '--clobber', action='store_true',
+                        help='Overwrite existing output files')
+
+    return parser.parse_args()
 
 
 def main():
-    "Main."
-    args = parse_arg()
+    """Main entry point for the application."""
+    print("RenPy-UnApk: Restore RenPy Android Games to Project Files")
+    print("Version 2.0 - Refactored")
 
-    print("RenPy-UnApk：将APK格式的RenPy游戏恢复为工程文件（提取+反编译）")
-    print("By Koshiro, Version 1.35")
-    print("\n使用前请将apk文件放在本目录下\n")
+    args = parse_arguments()
+    tool = RenPyUnapk(args)
 
-    allfiles = os.listdir()
-    apkfile = ''
-    for i in allfiles:
-        if i.lower().endswith(".apk"):
-            apkfile = i
-            try:
-                extract(apkfile)
-                unrpyc_main(apkfile, args)
-                print(f"{apkfile}还原完成！")
-            except Exception as e:
-                print(f"{apkfile} 还原失败。错误信息：\n{e}")
+    # If no APK specified, find in current directory
+    if not args.apk:
+        apk_files = list(Path.cwd().glob('*.apk'))
 
-    if not apkfile:
-        print("没有找到apk文件。你确定文件在此目录下吗？")
-    
-    input('\n按回车键退出')
+        if not apk_files:
+            tool.logger.error("No APK files found in current directory.")
+            sys.exit(1)
+
+        for apk in apk_files:
+            tool.process_apk(apk)
+    else:
+        apk_path = Path(args.apk)
+        if not apk_path.is_file():
+            tool.logger.error(f"File not found: {apk_path}")
+            sys.exit(1)
+
+        tool.process_apk(apk_path)
+
+    input('\nPress Enter to exit...')
 
 
-if __name__=='__main__':
+if __name__ == '__main__':
     main()

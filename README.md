@@ -16,3 +16,29 @@
 ### Credits
 
 unrpyc: https://github.com/madeddy/unrpyc
+
+
+-------------
+
+## Changelog (2025/01/31)
+
+### Refactor RenPy APK Decompilation Tool
+
+- Restructured unrpyc APK extraction and decompilation script
+- Improved multiprocessing support for file processing
+- Enhanced error handling and logging
+- Added more flexible configuration options
+- Resolved multiprocessing pickling issues
+- Maintained original unrpyc decompilation logic
+
+### Key changes:
+- Converted script to class-based architecture
+- Extracted worker function to top-level for multiprocessing compatibility
+- Implemented robust logging mechanism
+- Added default configuration generation
+- Improved file and directory handling
+- Enhanced error reporting and summary generation
+
+Fixes potential issues with file processing and provides a more maintainable codebase for RenPy APK decompilation.
+
+Version bumped to 2.0

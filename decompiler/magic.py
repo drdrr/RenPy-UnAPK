@@ -1,4 +1,22 @@
-# Copyright (c) 2015 CensoredUsername
+# Copyright (c) 2015-2024 CensoredUsername
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
 
 # This module provides tools for safely analyizing pickle files programmatically
 
@@ -11,10 +29,16 @@ import types
 import pickle
 import struct
 
+try:
+    # only available (and needed) from 3.4 onwards.
+    from importlib.machinery import ModuleSpec
+except:
+    pass
+
 if PY3:
     from io import BytesIO as StringIO
 else:
-    from io import StringIO
+    from cStringIO import StringIO
 
 __all__ = [
     "load", "loads", "safe_load", "safe_loads", "safe_dump", "safe_dumps",
@@ -109,9 +133,7 @@ A barebones instance of :class:`FakeClassType`. Inherit from this to create fake
 class FakeStrict(FakeClass, object):
     def __new__(cls, *args, **kwargs):
         self = FakeClass.__new__(cls)
-        # renpy 7.5/8 combat; Check if correctly initialized
-        # if args or kwargs:
-        if not (any([(), ([], )]) in args) and kwargs != {}:
+        if args or kwargs:
             raise FakeUnpicklingError("{0} was instantiated with unexpected arguments {1}, {2}".format(cls, args, kwargs))
         return self
 
@@ -386,9 +408,14 @@ class FakePackageLoader(object):
     this ensures that any attempt to get a submodule from module *root*
     results in a FakePackage, creating the illusion that *root* is an
     actual package tree.
+
+    This class is both a `finder` and a `loader`
     """
     def __init__(self, root):
         self.root = root
+
+    # the old way of loading modules. find_module returns a loader for the
+    # given module. In this case, that is this object itself again.
 
     def find_module(self, fullname, path=None):
         if fullname == self.root or fullname.startswith(self.root + "."):
@@ -396,8 +423,20 @@ class FakePackageLoader(object):
         else:
             return None
 
+    # the new way of loading modules. It returns a ModuleSpec, that has
+    # the loader attribute set to this class.
+
+    def find_spec(self, fullname, path, target=None):
+        if fullname == self.root or fullname.startswith(self.root + "."):
+            return ModuleSpec(fullname, self)
+        else:
+            return None
+
+    # loader methods. This loads the module.
+
     def load_module(self, fullname):
         return FakePackage(fullname)
+
 
 # Fake unpickler implementation
 
@@ -522,13 +561,22 @@ class SafePickler(pickle.Pickler if PY2 else pickle._Pickler):
     the classes themselves, and we need to override the method used for normally saving classes.
     """
 
-    def save_global(self, obj, name=None, pack=struct.pack):
+    def save_global(self, obj, name=None, pack=None):
         if isinstance(obj, FakeClassType):
-            self.write(pickle.GLOBAL + obj.__module__ + '\n' + obj.__name__ + '\n')
+            if PY2:
+                self.write(pickle.GLOBAL
+                           + obj.__module__ + '\n' + obj.__name__ + '\n')
+            elif self.proto >= 4:
+                self.save(obj.__module__)
+                self.save(obj.__name__)
+                self.write(pickle.STACK_GLOBAL)
+            else:
+                self.write(pickle.GLOBAL
+                           + (obj.__module__ + '\n' + obj.__name__ + '\n').decode("utf-8"))
             self.memoize(obj)
             return
 
-        pickle.Pickler.save_global(self, obj, name, pack)
+        super().save_global(obj, name)
 
 # the main API
 
@@ -591,11 +639,8 @@ def safe_load(file, class_factory=None, safe_modules=(), use_copyreg=False,
     return SafeUnpickler(file, class_factory, safe_modules, use_copyreg,
                          encoding=encoding, errors=errors).load()
 
-
-# py3 compat: at least needed if data src is py2 (also py3 renpy ?)
-# old py2: encoding="bytes"
 def safe_loads(string, class_factory=None, safe_modules=(), use_copyreg=False,
-               encoding="utf-8", errors="errors"):
+               encoding="bytes", errors="errors"):
     """
     Similar to :func:`safe_load`, but takes an 8-bit string (bytes in Python 3, str in Python 2)
     as its first argument instead of a binary :term:`file object`.
