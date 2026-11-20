@@ -226,7 +226,7 @@ def assert_is_normal_rpyc(f):
     Does not actually say anything about the _contents_ of that section, just that we were
     able to slice it out of there.
 
-    If succesful, returns the uncompressed contents of the first storage slot.
+    If successful, returns the uncompressed contents of the first storage slot.
     """
 
     f.seek(0)
@@ -304,7 +304,7 @@ def read_ast(f, context):
         try:
             data, stmts, d = try_decrypt_section(raw_data)
         except ValueError as e:
-            diagnosis.append(e.message)
+            diagnosis.append("\n".join(e.args))
         else:
             diagnosis.extend(d)
             context.log("\n".join(diagnosis))

@@ -301,8 +301,8 @@ def reconstruct_paraminfo(paraminfo):
     else:
         # ren'py 7.7/8.2 and above.
         # positional only, /, positional or keyword, *, keyword only, ***
-        # prescence of the / is indicated by positional only arguments being present
-        # prescence of the * (if no *args) are present is indicated by keyword only args
+        # presence of the / is indicated by positional only arguments being present
+        # presence of the * (if no *args) are present is indicated by keyword only args
         # being present.
         state = 1  # (0 = positional only, 1 = pos/key, 2 = keyword only)
 
@@ -362,7 +362,11 @@ def reconstruct_arginfo(arginfo):
     rv = ["("]
     sep = First("", ", ")
 
-    if hasattr(arginfo, 'starred_indexes'):
+    # ren'py 7.4 and below use arginfo.(arguments, extrapos, extrapw)
+    # ren'py 7.5 and above use arginfo.(arguments, starred_indexes, doublestarred_indexes)
+    # however, renṕy 8.4 and above do not store starred_indexes, doublestarred_indexes in the pickle
+    # so test for both the presence of starred_indexes and extrapos.
+    if hasattr(arginfo, 'starred_indexes') or not hasattr(arginfo, 'extrapos'):
         # ren'py 7.5 and above, PEP 448 compliant
         for i, (name, val) in enumerate(arginfo.arguments):
             rv.append(sep())
@@ -510,7 +514,7 @@ class Lexer:
         return word
 
     def simple_expression(self):
-        # check if there's anything in here acctually
+        # check if there's anything in here actually
         if self.eol():
             return False
 

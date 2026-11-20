@@ -24,7 +24,9 @@ from .util import DecompilerBase, First, reconstruct_paraminfo, \
 from . import atldecompiler
 
 from renpy import ui, sl2
-from renpy.ast import PyExpr
+# PyExpr was moved in v8.4 to astsupport and both appear now so we need a alias
+from renpy.astsupport import PyExpr  # v8.4+
+from renpy.ast import PyExpr as PyExpr_old  # before v8.4
 from renpy.text import text
 from renpy.sl2 import sldisplayables as sld
 from renpy.display import layout, behavior, im, motion, dragdrop, transform
@@ -186,7 +188,8 @@ class SL2Decompiler(DecompilerBase):
         self.indent()
         self.write("use ")
         args = reconstruct_arginfo(ast.args)
-        if isinstance(ast.target, PyExpr):
+
+        if isinstance(ast.target, (PyExpr, PyExpr_old)):
             self.write(f'expression {ast.target}')
             if args:
                 self.write(" pass ")
@@ -258,7 +261,10 @@ class SL2Decompiler(DecompilerBase):
                 and isinstance(ast.children[0], sl2.slast.SLDisplayable)
                 and ast.children[0].children
                 and (not ast.keyword
-                     or ast.children[0].location[1] > ast.keyword[-1][1].linenumber)
+                     # this line shoudln't be necessary, but guards against broken keywords
+                     or (ast.keyword[-1][1] is not None and
+                         ast.children[0].location[1] > ast.keyword[-1][1].linenumber
+                    ))
                 and (atl_transform is None
                      or ast.children[0].location[1] > atl_transform.loc[1])):
 
@@ -491,7 +497,7 @@ class SL2Decompiler(DecompilerBase):
         # additionally, since 7.3 upwards, tag cannot be placed on the same line as `screen`
         # for whatever reason.
         # it is currently impossible to have both an `as` and a `tag` keyword in the same
-        # displayble `as` is only used for displayables, `tag` for screens.
+        # displayable. `as` is only used for displayables, `tag` for screens.
         # strategies:
         # - if there's several empty lines before any line, we can make some new lines for them
         # - if the first line is a keyword line, we can merge them with it
@@ -589,7 +595,7 @@ class SL2Decompiler(DecompilerBase):
 
         if ty == "keywords_broken":
             self.write(sep())
-            self.write(item[3])
+            self.write(item[3][0])
 
         if first_line and has_block:
             self.write(":")
