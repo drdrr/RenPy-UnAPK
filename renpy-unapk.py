@@ -1,3 +1,9 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.9,<3.15"
+# dependencies = ["androguard>=4"]
+# ///
+import re
 import sys
 import zipfile
 import shutil
@@ -14,6 +20,40 @@ except ImportError:
 
 from pathlib import Path
 import unrpyc
+
+# Optional: androguard resolves resources through resources.arsc, which is
+# required for APKs built by newer RAPT (shortened/obfuscated res/ paths,
+# e.g. res/-i.png instead of res/mipmap-xxxhdpi-v4/icon_foreground.png).
+try:
+    from androguard.core.apk import APK
+    try:
+        # androguard logs very verbosely through loguru; silence it.
+        from loguru import logger as _loguru_logger
+        _loguru_logger.remove()
+    except Exception:
+        pass
+    HAS_ANDROGUARD = True
+except ImportError:
+    HAS_ANDROGUARD = False
+
+# Where RAPT has stored the game directory inside the APK, newest first.
+GAME_DIR_CANDIDATES = ('assets/x-game/', 'assets/game/')
+
+# Icon resource names -> output file names expected by the Ren'Py SDK.
+ICON_RESOURCES = {
+    'icon_background': 'android-icon_background.png',
+    'icon_foreground': 'android-icon_foreground.png',
+}
+
+# Top-level assets such as android-presplash.jpg / android-downloading.jpg.
+ANDROID_ASSET_RE = re.compile(r'^assets/(?:x-)?(android-[^/]+\.(?:jpg|jpeg|png))$', re.I)
+
+# Legacy layout: res/mipmap-<density>[-vN]/<name>.png
+LEGACY_ICON_RE = re.compile(r'^res/mipmap-([a-z]+dpi)(?:-v\d+)?/([^/]+)\.png$')
+DENSITY_RANK = {'ldpi': 120, 'mdpi': 160, 'tvdpi': 213, 'hdpi': 240,
+                'xhdpi': 320, 'xxhdpi': 480, 'xxxhdpi': 640}
+
+RAPT_PREFIX = 'x-'
 
 class Context:
     def __init__(self):
@@ -53,7 +93,7 @@ def worker_common(arg_tup):
         unrpyc.decompile_rpyc(
             filename, context,
             overwrite=getattr(args, 'clobber', False),
-            try_harder=getattr(args, 'try_harder', False)
+            try_harder=getattr(args, 'try_harder', False),
             dump=getattr(args, 'dump', False),
             no_pyexpr=getattr(args, 'no_pyexpr', False),
             comparable=getattr(args, 'comparable', False),
@@ -147,73 +187,135 @@ class RenPyUnapk:
 
         return prepared_args
 
-    def remove_prefix_from_names(self, dir_path: Path, prefix: str) -> None:
+    @staticmethod
+    def _strip_rapt_prefix(rel_path: str) -> Path:
         """
-        Recursively remove specified prefix from all file and directory names.
-
-        Args:
-            dir_path (Path): Directory to process
-            prefix (str): Prefix to remove from names
+        RAPT prefixes every file/dir under the game folder with 'x-' so that
+        aapt doesn't drop names starting with '_' or '.'. Strip it from the
+        start of each path component only (not from the middle of names).
         """
-        for item in dir_path.rglob('*'):
-            new_name = item.name.replace(prefix, '')
-            new_path = item.parent / new_name
+        parts = [p[len(RAPT_PREFIX):] if p.startswith(RAPT_PREFIX) else p
+                 for p in rel_path.split('/') if p]
+        return Path(*parts)
 
-            try:
-                item.rename(new_path)
-            except OSError as e:
-                self.logger.error(f"Could not rename {item}: {e}")
+    @staticmethod
+    def _safe_extract(zf: zipfile.ZipFile, member: str, dest: Path, root: Path) -> None:
+        """Extract a single member to dest, refusing paths outside root."""
+        dest_resolved = dest.resolve()
+        if root.resolve() not in dest_resolved.parents:
+            raise ValueError(f"Unsafe path in APK: {member}")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        with zf.open(member) as src, open(dest, 'wb') as dst:
+            shutil.copyfileobj(src, dst)
+
+    def _find_game_prefix(self, names) -> str:
+        for prefix in GAME_DIR_CANDIDATES:
+            if any(n.startswith(prefix) for n in names):
+                return prefix
+        raise FileNotFoundError(
+            "No game directory found in APK (looked for: "
+            + ", ".join(GAME_DIR_CANDIDATES) + ")")
+
+    def _resolve_icons_arsc(self, apk_path: Path) -> dict:
+        """
+        New RAPT: res/ paths are shortened, so look the icons up by resource
+        name in resources.arsc and pick the highest-density PNG.
+        Returns {resource_name: path_in_apk}.
+        """
+        found = {}
+        if not HAS_ANDROGUARD:
+            return found
+        try:
+            apk = APK(str(apk_path))
+            arsc = apk.get_android_resources()
+            pkg = apk.get_package()
+            for name in ICON_RESOURCES:
+                rid = None
+                for res_type in ('mipmap', 'drawable'):
+                    rid = arsc.get_res_id_by_key(pkg, res_type, name)
+                    if rid is not None:
+                        break
+                if rid is None:
+                    continue
+                configs = [(cfg, p) for cfg, p in arsc.get_resolved_res_configs(rid)
+                           if isinstance(p, str) and p.lower().endswith('.png')]
+                if configs:
+                    cfg, path = max(configs, key=lambda cp: cp[0].get_density())
+                    found[name] = path
+        except Exception as e:
+            self.logger.warning(f"Could not read resources.arsc: {e}")
+        return found
+
+    @staticmethod
+    def _resolve_icons_legacy(names) -> dict:
+        """Old RAPT: res/mipmap-<density>[-vN]/<name>.png, highest density wins."""
+        best = {}
+        for n in names:
+            m = LEGACY_ICON_RE.match(n)
+            if not m or m.group(2) not in ICON_RESOURCES:
+                continue
+            rank = DENSITY_RANK.get(m.group(1), 0)
+            if m.group(2) not in best or rank > best[m.group(2)][0]:
+                best[m.group(2)] = (rank, n)
+        return {k: v[1] for k, v in best.items()}
 
     def extract_apk(self, apk_path: Path) -> Path:
         """
-        Extract game files from an APK.
+        Extract game files, icons and presplash images from an APK.
 
         Args:
             apk_path (Path): Path to the APK file
 
         Returns:
-            Path: Extracted game directory
+            Path: Extracted project directory
         """
         self.logger.info(f"Extracting {apk_path}")
 
-        # Create extraction directories
         game_folder = apk_path.with_suffix('')
-        temp_folder = Path.cwd() / "TMP_APK_EXTRACT"
         game_folder.mkdir(exist_ok=True)
-        temp_folder.mkdir(exist_ok=True)
 
-        # Extract APK contents
         with zipfile.ZipFile(apk_path) as zf:
-            zf.extractall(temp_folder)
+            names = zf.namelist()
+            name_set = set(names)
 
-        # Move required files
-        try:
-            shutil.move(
-                temp_folder / 'assets' / 'x-game',
-                game_folder
-            )
+            # 1. Game files -> <project>/game/
+            prefix = self._find_game_prefix(names)
+            count = 0
+            for member in names:
+                if not member.startswith(prefix) or member.endswith('/'):
+                    continue
+                rel = self._strip_rapt_prefix(member[len(prefix):])
+                self._safe_extract(zf, member, game_folder / 'game' / rel, game_folder)
+                count += 1
+            self.logger.info(f"Extracted {count} game files from {prefix}")
 
-            # Move icons and splash screen
-            icon_sources = [
-                ('res/mipmap-xxxhdpi-v4/icon_background.png', 'android-icon_background.png'),
-                ('res/mipmap-xxxhdpi-v4/icon_foreground.png', 'android-icon_foreground.png'),
-                ('assets/android-presplash.jpg', 'android-presplash.jpg')
-            ]
+            # 2. Icons: legacy paths first (cheap), then resources.arsc for
+            #    anything missing (new RAPT with shortened resource paths).
+            icons = self._resolve_icons_legacy(names)
+            missing = [n for n in ICON_RESOURCES if n not in icons]
+            if missing:
+                if HAS_ANDROGUARD:
+                    arsc_icons = self._resolve_icons_arsc(apk_path)
+                    icons.update({k: v for k, v in arsc_icons.items() if k in missing})
+                else:
+                    self.logger.warning(
+                        "Icons not at legacy paths and androguard is not installed; "
+                        "run 'pip install androguard' to extract icons from newer APKs.")
 
-            for src, dest in icon_sources:
-                src_path = temp_folder / src
-                if src_path.exists():
-                    shutil.move(src_path, game_folder / dest)
+            for res_name, out_name in ICON_RESOURCES.items():
+                src = icons.get(res_name)
+                if src and src in name_set:
+                    self._safe_extract(zf, src, game_folder / out_name, game_folder)
+                    self.logger.info(f"Icon {res_name}: {src} -> {out_name}")
+                else:
+                    self.logger.warning(f"Icon {res_name} not found")
 
-        except Exception as e:
-            self.logger.error(f"Error moving files: {e}")
-            raise
-
-        # Clean up temporary folder
-        shutil.rmtree(temp_folder)
-
-        # Remove 'x-' prefix from files and directories
-        self.remove_prefix_from_names(game_folder, 'x-')
+            # 3. android-presplash / android-downloading images
+            for member in names:
+                m = ANDROID_ASSET_RE.match(member)
+                if m:
+                    self._safe_extract(zf, member, game_folder / m.group(1), game_folder)
+                    self.logger.info(f"Asset: {member} -> {m.group(1)}")
 
         self.logger.info(f"Extracted to {game_folder}")
         return game_folder
@@ -277,7 +379,7 @@ def parse_arguments():
     parser.add_argument('-l', '--language', default='english',
                         help='Language for translation file (default: english)')
 
-    parser.add_argument('-t', '--translation-file'
+    parser.add_argument('-t', '--translation-file',
                         help='File to use for translations during decompilation')
 
     parser.add_argument('--try-harder', action='store_true',
